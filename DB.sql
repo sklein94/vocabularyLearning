@@ -41,6 +41,7 @@ CREATE TABLE STATISTIC(
 	ID NUMBER GENERATED ALWAYS AS IDENTITY (START WITH 1 INCREMENT BY 1),
 	USERS_ID NUMBER NOT NULL,
     TIMESTAMP_DONE TIMESTAMP(6),
+	TIMESTAMP_GENERATED TIMESTAMP(6) DEFAULT CURRENT_TIMESTAMP,
 	CONSTRAINT STATISTIC_PK PRIMARY KEY(ID),
 	CONSTRAINT USER_FK FOREIGN KEY (USERS_ID) REFERENCES USERS(ID)
 );
@@ -88,6 +89,7 @@ CREATE TABLE DEBUG(
 ------------------------------------Create Views-------------------------------------------------------------------------------------------------------------------------------------------------
 ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
+--Any vocabulary entry with any value asociated with any value of any translation entry
 CREATE OR REPLACE FORCE VIEW ALL_VOCABULARY_ENTRIES AS
 	SELECT U.ID AS UNIT_ID, U.NAME AS UNIT, V.CATEGORY, V.ID AS VOC_ID, V.VOCABULARY, V.LANGUAGE_ID AS VOC_LANG_ID, VL.NAME AS VOC_LANG, T.ID AS TRA_ID, T.TRANSLATION, T.LANGUAGE_ID AS TRA_LANG_ID, LL.NAME AS TRA_LANG
 	FROM  VOCABULARY V
@@ -95,6 +97,13 @@ CREATE OR REPLACE FORCE VIEW ALL_VOCABULARY_ENTRIES AS
 		INNER JOIN UNIT U ON V.UNIT_ID = U.ID
 		INNER JOIN LANGUAGE VL ON VL.ID = V.LANGUAGE_ID 
 		INNER JOIN LANGUAGE LL ON LL.ID = T.LANGUAGE_ID;
+		
+	
+--Any vocabulary string with any translation string, distinct entries	
+CREATE OR REPLACE FORCE VIEW ALL_VOCABULARY_TRANSLATIONS AS
+	SELECT DISTINCT LISTAGG(TRANSLATION, ', ') WITHIN GROUP (ORDER BY VOCABULARY) OVER (PARTITION BY VOCABULARY) AS TRANSLATION,
+								   LISTAGG(VOCABULARY, ', ') WITHIN GROUP (ORDER BY TRANSLATION) OVER (PARTITION BY TRANSLATION) AS VOCABULARY
+	FROM (SELECT VOCABULARY, TRANSLATION FROM VOCABULARY INNER JOIN TRANSLATION ON TRANSLATION.VOCABULARY_ID = VOCABULARY.ID) VOC;
 
 ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 ------------------------------------Declare Check Functions----------------------------------------------------------------------------------------------------------------------------------
@@ -285,7 +294,7 @@ CREATE OR REPLACE PROCEDURE CREATE_NEW_STATISTIC (P_CATEGORY IN NUMBER, P_UNIT I
 		SELECT ID INTO V_STATISTIC_ID FROM STATISTIC WHERE ROWID=(SELECT MAX(ROWID) FROM STATISTIC);
 
 		--insert values into link table
-		FOR	I IN (SELECT DISTINCT MIN(VOC_ID) OVER (PARTITION BY TRANSLATION) AS ID FROM ALL_VOCABULARY_ENTRIES WHERE (CATEGORY = P_CATEGORY OR P_CATEGORY = -1) AND (UNIT = P_UNIT OR P_UNIT = ' '))
+		FOR	I IN (SELECT DISTINCT MIN(VOC_ID) AS ID FROM ALL_VOCABULARY_ENTRIES WHERE (CATEGORY = P_CATEGORY OR P_CATEGORY = -1) AND (UNIT = P_UNIT OR P_UNIT = ' ') GROUP BY TRANSLATION)
 		LOOP
 			INSERT INTO VOCABULARY_IN_STATISTIC (STATISTIC_ID, VOCABULARY_ID) VALUES (V_STATISTIC_ID, I.ID);		
 			COMMIT;
@@ -293,30 +302,13 @@ CREATE OR REPLACE PROCEDURE CREATE_NEW_STATISTIC (P_CATEGORY IN NUMBER, P_UNIT I
 
 	END; 
 /		
+
 ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 ------------------------------------Testscript ausführen---------------------------------------------------------------------------------------------------------------------------------------
 ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
---select listagg(vocabulary, ', ') within group (order by vocabulary desc), translation from all_vocabulary_entries group by translation
---select distinct min(voc_id) over (partition by translation) from all_vocabulary_entries
-
-
---test
---select distinct listagg(vocabulary, ', ') within group (order by vocabulary desc) from all_vocabulary_entries group by translation
---select distinct listagg(translation, ', ') within group (order by translation desc) from all_vocabulary_entries group by vocabulary
-
-
---select a.tra, b.voc from
---(select distinct listagg(translation, ', ') within group (order by translation desc) as tra, vocabulary from all_vocabulary_entries group by vocabulary) a,
---(select distinct listagg(vocabulary, ', ') within group (order by vocabulary desc) as voc, translation from all_vocabulary_entries group by translation) b
---where a.vocabulary = b.voc and a.tra = b.translation
-
-
-
---test ende
-
+--to learn:
 --cube
 --rollup
---over partition by
 
 BEGIN
 	--will be inserted
@@ -361,17 +353,13 @@ BEGIN
 	INSERT_NEW_VOCABULARY_WITH_TRANSLATION('DE', 'to race', 'EN', 'rennen', '1');
 	INSERT_NEW_VOCABULARY_WITH_TRANSLATION('DE', 'to career', 'EN', 'rennen', '1');
 	
-	--ÜBERARBEITE DEN GESAMTEN MECHANISMUS DES EINFÜGENS VON VOKABELN:
-		--
-	
-	
-	
+
 	--will be inserted
-	INSERT_NEW_USER('Simon','Klein','simon.klein@triology.de');
-	INSERT_NEW_USER('Lisa','Milde','lisa.milde@triology.de');
+	INSERT_NEW_USER('Simon','Klein','simonmail');
+	INSERT_NEW_USER('Lisa','Milde','lisamail');
 
 	--won't be inserted
-	INSERT_NEW_USER('Hallo','Welt','simon.klein@triology.de');
+	INSERT_NEW_USER('Hallo','Welt','simonmail');
 	
 	
 	--Creates a new Statistic
