@@ -13,6 +13,7 @@ DROP TABLE T_STATISTIC;
 DROP TABLE T_LANGUAGE;
 DROP TABLE T_UNIT;
 DROP TABLE T_USERS;
+DROP TABLE T_ALL_RESSOURCES;
 
 ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 ---------------------------------Creating the Tables--------------------------------------------------------------------------------------------------------------------------------------------
@@ -94,6 +95,12 @@ CREATE TABLE T_DEBUG(
 	MESSAGE_NUM NUMBER,
 	CONSTRAINT DEBUG_PK PRIMARY KEY (ID)
 );
+
+CREATE TABLE T_ALL_RESSOURCES(
+	RES_KEY VARCHAR(32) NOT NULL, 
+	RES VARCHAR2(256) NOT NULL,
+	CONSTRAINT RES_PK PRIMARY KEY (RES_KEY)
+);
 ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 ------------------------------------Create Views-------------------------------------------------------------------------------------------------------------------------------------------------
 ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -112,6 +119,12 @@ CREATE OR REPLACE FORCE VIEW V_ALL_VOCABULARY_ENTRIES AS
 CREATE OR REPLACE FORCE VIEW V_ALL_VOCABULARY_TRANSLATIONS AS
 	SELECT DISTINCT VOCABULARY, LISTAGG(TRANSLATION, ', ') WITHIN GROUP (ORDER BY VOCABULARY) OVER (PARTITION BY VOCABULARY) AS TRANSLATION
 	FROM (SELECT VOCABULARY, TRANSLATION FROM T_VOCABULARY INNER JOIN T_TRANSLATION ON T_TRANSLATION.VOCABULARY_ID = T_VOCABULARY.ID) VOC;
+		
+	
+--Any vocabulary to learn
+CREATE OR REPLACE FORCE VIEW V_ALL_VOCABULARY_TO_LEARN AS
+	SELECT TV.ID AS S_ID, S.USERS_ID AS U_ID, U.EMAIL AS MAIL FROM T_VOCABULARY_IN_STATISTIC TV INNER JOIN T_STATISTIC S ON TV.STATISTIC_ID = S.ID INNER JOIN T_USERS U ON U.ID = S.USERS_ID
+	WHERE TV.CORRECT IS NULL;
 
 ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 ------------------------------------Declare Check Functions----------------------------------------------------------------------------------------------------------------------------------
@@ -235,6 +248,25 @@ CREATE OR REPLACE FUNCTION GET_ID_OF_LANGUAGE(P_LANGUAGE IN VARCHAR2)
 	END;
 /
 
+--------------------returns the ressource by key-----------------------------
+CREATE OR REPLACE FUNCTION GET_RESSOURCE(P_RES_KEY IN VARCHAR2)
+	RETURN VARCHAR2
+	IS V_RES VARCHAR2(256);
+	BEGIN
+		SELECT RES INTO V_RES FROM T_ALL_RESSOURCES WHERE RES_KEY = P_RES_KEY;
+		RETURN V_RES;
+	END;
+/
+
+--------------------returns the ressource by key-----------------------------
+CREATE OR REPLACE FUNCTION GET_VOCABULARY_BY_ID(P_ID IN NUMBER)
+	RETURN VARCHAR2
+	IS V_VOCABULARY VARCHAR2(256);
+	BEGIN
+		SELECT VOCABULARY INTO V_VOCABULARY FROM T_VOCABULARY WHERE ID = P_ID;
+		RETURN V_VOCABULARY;
+	END;
+/
 ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 ------------------------------------Declare Procedures - "private" procedures---------------------------------------------------------------------------------------------------------------
 ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -371,8 +403,91 @@ CREATE OR REPLACE PROCEDURE TRY_ANSWER(P_ID_OF_VOCABULARY_IN_STATISTIC IN NUMBER
 	END;
 /
 
+CREATE OR REPLACE PROCEDURE SEND_MAIL (P_TO_EMAIL IN VARCHAR2, P_SUBJECT IN VARCHAR2, P_MESSAGE IN  VARCHAR2)
+  IS
+     V_FROM      VARCHAR2(80) := 'vocabeltrainer@COMPANY.com';
+     V_RECIPIENT VARCHAR2(80) := P_TO_EMAIL;
+     V_SUBJECT   VARCHAR2(80) := P_SUBJECT;
+      V_MAIL_HOST VARCHAR2(30) := 'MAILSERVERHIERREIN';
+      V_MAIL_CONN UTL_SMTP.CONNECTION;
+      CRLF        VARCHAR2(2)  := chr(13)||chr(10);
+  BEGIN
+     V_MAIL_CONN := UTL_SMTP.OPEN_CONNECTION(V_MAIL_HOST, 25);
+     UTL_SMTP.HELO(V_MAIL_CONN, V_MAIL_HOST);
+     UTL_SMTP.MAIL(V_MAIL_CONN, V_FROM);
+     UTL_SMTP.RCPT(V_MAIL_CONN, V_RECIPIENT);
+     UTL_SMTP.DATA(V_MAIL_CONN,
+       'Date: '   || TO_CHAR(SYSDATE, 'Dy, DD Mon YYYY hh24:mi:ss') || CRLF ||
+       'From: '   || V_FROM || CRLF ||
+       'Subject: '|| V_SUBJECT || CRLF ||
+       'To: '     || V_RECIPIENT || CRLF ||
+	   P_MESSAGE
+     );
+     UTL_SMTP.QUIT(V_MAIL_CONN);
+  END;
+/
 
 
+CREATE OR REPLACE PROCEDURE SEND_MAILS
+IS
+	V_USER_EMAIL VARCHAR2(256);
+	V_FIRSTNAME VARCHAR2(256);
+	V_LASTNAME VARCHAR2(256);
+	V_VOCABULARY_ID NUMBER;
+	V_A VARCHAR2(256) := GET_RESSOURCE('voc_hello');
+	V_B VARCHAR2(256) := GET_RESSOURCE('voc_whoiam');
+	V_C VARCHAR2(256) := GET_RESSOURCE('voc_whatiwant');
+	V_D VARCHAR2(256) := GET_RESSOURCE('voc_lastword');
+    CRLF VARCHAR2(2)  := CHR(13) || CHR(10);
+	V_MESSAGE VARCHAR2(4096) := '';	
+BEGIN
+	
+			FOR	I IN (SELECT DISTINCT  U_ID FROM V_ALL_VOCABULARY_TO_LEARN)
+			LOOP
+				V_MESSAGE := 'begin' || CRLF;
+				SELECT FIRST_NAME INTO V_FIRSTNAME FROM T_USERS WHERE ID = I.U_ID;
+				SELECT LAST_NAME INTO V_LASTNAME FROM T_USERS  WHERE ID = I.U_ID;
+				SELECT EMAIL INTO V_USER_EMAIL FROM T_USERS WHERE ID = I.U_ID;
+				FOR J IN (SELECT S_ID FROM V_ALL_VOCABULARY_TO_LEARN WHERE U_ID = I.U_ID)
+				LOOP
+					SELECT VOCABULARY_ID INTO V_VOCABULARY_ID FROM T_VOCABULARY_IN_STATISTIC WHERE ID = J.S_ID;
+					V_MESSAGE := V_MESSAGE || '/*' ||GET_VOCABULARY_BY_ID(V_VOCABULARY_ID) || ': ' || '*/TRY_ANSWER(' || TO_CHAR(J.S_ID) ||', '' '', '|| I.U_ID ||');' || CRLF;
+				END LOOP;
+				V_MESSAGE := V_MESSAGE ||  'end;';
+				SEND_MAIL(V_USER_EMAIL, 'Lerne mal Vocabeln...',  V_A || V_FIRSTNAME || ' ' || V_LASTNAME || V_B || CRLF || V_C || CRLF || V_D || CRLF || CRLF || V_MESSAGE);
+			END LOOP;
+END;
+/
+
+CREATE OR REPLACE PROCEDURE CREATE_VOCABULARY_CHECKS
+IS 
+BEGIN
+END;
+/
+
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+-----------------------------------------------------------------------create jobs--------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+BEGIN 
+    DBMS_SCHEDULER.DROP_JOB ('SEND_MAILS_TO_USERS');
+   	dbms_scheduler.create_job ( 
+    		job_name => 'SEND_MAILS_TO_USERS', 
+    		job_type => 'PLSQL_BLOCK', 
+    		job_action => 'SEND_MAILS;', 
+    		enabled => true, 
+    		repeat_interval => 'FREQ=DAILY;BYHOUR=8'
+   ); 
+END;
+/
+
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+----------------------------------------------------------------------------default data insert--------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+INSERT INTO T_ALL_RESSOURCES (RES_KEY, RES) VALUES ('voc_hello', 'Hallo ');
+INSERT INTO T_ALL_RESSOURCES (RES_KEY, RES) VALUES ('voc_whoiam', '. Ich bin dein persoenlicher Vocabeltrainer :). ');
+INSERT INTO T_ALL_RESSOURCES (RES_KEY, RES) VALUES ('voc_whatiwant', 'Du hast schon lange keine Vocabeln mehr gelernt. Deswegen solltest du das jetzt unbedingt tun.');
+INSERT INTO T_ALL_RESSOURCES (RES_KEY, RES) VALUES ('voc_lastword', 'Wollte ich nur einmal gesagt haben. Danke. Und viel Spass beim Lernen ;).');
+COMMIT;
 ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 ------------------------------------Testscript ausführen---------------------------------------------------------------------------------------------------------------------------------------
 ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -393,7 +508,7 @@ BEGIN
 		
 	
 	INSERT_NEW_VOCABULARY_WITH_TRANSLATION('DE', 'rennen', 'EN', 'to career', '1');
-	INSERT_NEW_VOCABULARY_WITH_TRANSLATION('DE', 'rennen', 'EN', 'to run ', '1');
+	INSERT_NEW_VOCABULARY_WITH_TRANSLATION('DE', 'rennen', 'EN', 'to run', '1');
 	INSERT_NEW_VOCABULARY_WITH_TRANSLATION('DE', 'rennen', 'EN', 'to race', '1');
 	INSERT_NEW_VOCABULARY_WITH_TRANSLATION('DE', 'to run, to race, to career', 'EN', 'rennen', '1');
 	
@@ -416,33 +531,19 @@ BEGIN
 	
 
 	--will be inserted
-	INSERT_NEW_USER('Simon','Klein','simonmail');
-	INSERT_NEW_USER('Lisa','Milde','lisamail');
 	
 	
 	--Creates a new Statistic
 	 CREATE_NEW_STATISTIC (-1, ' ', 1);
+	 CREATE_NEW_STATISTIC (-1, ' ', 2);
 	 
-	 
-	 --TEST
-	 
-	 TRY_ANSWER(1, 'to put', 1);
-	  TRY_ANSWER(2, 'to put', 1);
-	   TRY_ANSWER(3, 'to put', 1);
-	    TRY_ANSWER(4, 'to put', 1);
-		 TRY_ANSWER(5, 'to put', 1);
-		  TRY_ANSWER(6, 'to put', 1);
-		   TRY_ANSWER(7, 'to put', 1);
-		    TRY_ANSWER(8, 'to put', 1);
-			 TRY_ANSWER(9, 'to put', 1);
-			  TRY_ANSWER(10, 'to put', 1);
+
 		   
 
 	
 END;
+/
 
-
-	
 	
 						
 	
