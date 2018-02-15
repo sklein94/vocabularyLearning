@@ -14,6 +14,7 @@ DROP TABLE T_LANGUAGE;
 DROP TABLE T_UNIT;
 DROP TABLE T_USERS;
 DROP TABLE T_ALL_RESSOURCES;
+DROP TABLE T_STATISTIC_TIME;
 
 ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 ---------------------------------Creating the Tables--------------------------------------------------------------------------------------------------------------------------------------------
@@ -53,8 +54,6 @@ CREATE TABLE T_VOCABULARY(
 	UNIT_ID NUMBER NOT NULL,
 	LANGUAGE_ID NUMBER NOT NULL,
 	VOCABULARY VARCHAR(32) NOT NULL,
-	CATEGORY NUMBER NOT NULL,
-	COUNTER NUMBER NOT NULL,
 	CONSTRAINT VOCABULARY_PK PRIMARY KEY(ID),
 	CONSTRAINT UNIT_FK FOREIGN KEY (UNIT_ID) REFERENCES T_UNIT(ID),
 	CONSTRAINT LANGUAGE_VOC_FK FOREIGN KEY (LANGUAGE_ID) REFERENCES T_LANGUAGE(ID)
@@ -74,7 +73,9 @@ CREATE TABLE T_USER_VOCABULARY_PRACTICE(
 	TIMESTAMP_LAST_PRACTICE TIMESTAMP(6) DEFAULT CURRENT_TIMESTAMP,
 	VOCABULARY_ID NUMBER NOT NULL,
 	USERS_ID NUMBER NOT NULL,
-	CONSTRAINT USER_PRACTICE_PK PRIMARY KEY (TIMESTAMP_LAST_PRACTICE, VOCABULARY_ID, USERS_ID),
+	CATEGORY NUMBER NOT NULL,
+	COUNTER NUMBER NOT NULL,
+	CONSTRAINT USER_PRACTICE_PK PRIMARY KEY (VOCABULARY_ID, USERS_ID),
 	CONSTRAINT PRACTICE_USER_ID_FK FOREIGN KEY (USERS_ID) REFERENCES T_USERS(ID),
 	CONSTRAINT PRACTICE_VOCABULARY_ID_FK FOREIGN KEY (VOCABULARY_ID) REFERENCES T_VOCABULARY(ID)
 );
@@ -101,18 +102,27 @@ CREATE TABLE T_ALL_RESSOURCES(
 	RES VARCHAR2(256) NOT NULL,
 	CONSTRAINT RES_PK PRIMARY KEY (RES_KEY)
 );
+
+CREATE TABLE T_STATISTIC_TIME(
+	CATEGORY NUMBER,
+	HOURS NUMBER,
+	CONSTRAINT STATISTIC_TIME_PK PRIMARY KEY (CATEGORY)
+);
 ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 ------------------------------------Create Views-------------------------------------------------------------------------------------------------------------------------------------------------
 ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
 --Any vocabulary entry with any value asociated with any value of any translation entry 
 CREATE OR REPLACE FORCE VIEW V_ALL_VOCABULARY_ENTRIES AS
-	SELECT U.ID AS UNIT_ID, U.NAME AS UNIT, V.CATEGORY, V.ID AS VOC_ID, V.VOCABULARY, V.LANGUAGE_ID AS VOC_LANG_ID, VL.NAME AS VOC_LANG, T.ID AS TRA_ID, T.TRANSLATION, T.LANGUAGE_ID AS TRA_LANG_ID, LL.NAME AS TRA_LANG
-	FROM  T_VOCABULARY V
-		INNER JOIN T_TRANSLATION T ON V.ID = T.VOCABULARY_ID 
-		INNER JOIN T_UNIT U ON V.UNIT_ID = U.ID
-		INNER JOIN T_LANGUAGE VL ON VL.ID = V.LANGUAGE_ID 
-		INNER JOIN T_LANGUAGE LL ON LL.ID = T.LANGUAGE_ID;
+SELECT TP.TIMESTAMP_LAST_PRACTICE,  COALESCE(CATEGORY, 0) AS CATEGORY, TU.ID AS USERS_ID, U.ID AS UNIT_ID, U.NAME AS UNIT, V.ID AS VOC_ID, V.VOCABULARY, V.LANGUAGE_ID AS VOC_LANG_ID, VL.NAME AS VOC_LANG, T.ID AS TRA_ID, T.TRANSLATION, T.LANGUAGE_ID AS TRA_LANG_ID, LL.NAME AS TRA_LANG
+        FROM  T_VOCABULARY V
+          INNER JOIN T_TRANSLATION T ON V.ID = T.VOCABULARY_ID 
+          INNER JOIN T_UNIT U ON V.UNIT_ID = U.ID
+          INNER JOIN T_LANGUAGE VL ON VL.ID = V.LANGUAGE_ID 
+          INNER JOIN T_LANGUAGE LL ON LL.ID = T.LANGUAGE_ID
+          LEFT JOIN T_USER_VOCABULARY_PRACTICE TP ON TP.VOCABULARY_ID = V.ID,
+          T_USERS TU;
+	
 		
 	
 --Any vocabulary string with any translation string, distinct entries	
@@ -123,8 +133,22 @@ CREATE OR REPLACE FORCE VIEW V_ALL_VOCABULARY_TRANSLATIONS AS
 	
 --Any vocabulary to learn
 CREATE OR REPLACE FORCE VIEW V_ALL_VOCABULARY_TO_LEARN AS
-	SELECT TV.ID AS S_ID, S.USERS_ID AS U_ID, U.EMAIL AS MAIL FROM T_VOCABULARY_IN_STATISTIC TV INNER JOIN T_STATISTIC S ON TV.STATISTIC_ID = S.ID INNER JOIN T_USERS U ON U.ID = S.USERS_ID
+	SELECT TV.ID AS VOC_IN_STAT_ID, S.USERS_ID AS USERS_ID, U.EMAIL AS MAIL 
+	FROM T_VOCABULARY_IN_STATISTIC TV 
+		INNER JOIN T_STATISTIC S ON TV.STATISTIC_ID = S.ID 
+		INNER JOIN T_USERS U ON U.ID = S.USERS_ID
 	WHERE TV.CORRECT IS NULL;
+	
+	
+--------------------------------any vocabulary with category and timestamp----------------------------------------------
+CREATE OR REPLACE FORCE VIEW V_ALL_VOCABULARY_PRACTICES AS
+	SELECT VOCABULARY_ID, USERS_ID, A.CATEGORY,  (HOURS - HOURS_SINCE_LAST_PRACTICE) AS HOURS_NEEDED
+		FROM
+		(SELECT A.*, COALESCE(UP.CATEGORY, 0) AS CATEGORY, COALESCE(EXTRACT(DAY FROM CURRENT_TIMESTAMP - TIMESTAMP_LAST_PRACTICE)*24+EXTRACT(HOUR FROM CURRENT_TIMESTAMP - TIMESTAMP_LAST_PRACTICE), 999999) AS HOURS_SINCE_LAST_PRACTICE
+		FROM (SELECT V.ID AS VOCABULARY_ID, U.ID AS USERS_ID FROM T_VOCABULARY V, T_USERS U) A 
+			LEFT JOIN T_USER_VOCABULARY_PRACTICE UP ON UP.VOCABULARY_ID = A.VOCABULARY_ID AND UP.USERS_ID = A.USERS_ID) A
+			INNER JOIN T_STATISTIC_TIME STT ON STT.CATEGORY = A.CATEGORY
+ORDER BY A.USERS_ID, A.VOCABULARY_ID;
 
 ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 ------------------------------------Declare Check Functions----------------------------------------------------------------------------------------------------------------------------------
@@ -267,6 +291,16 @@ CREATE OR REPLACE FUNCTION GET_VOCABULARY_BY_ID(P_ID IN NUMBER)
 		RETURN V_VOCABULARY;
 	END;
 /
+
+------------------------returns the category id-------------------------------
+CREATE OR REPLACE FUNCTION GET_CATEGORY_ID(P_VOCABULARY_ID IN NUMBER, P_USERS_ID IN NUMBER)
+	RETURN NUMBER
+	IS V_CATEGORY_ID VARCHAR2(256);
+	BEGIN
+		SELECT CATEGORY INTO V_CATEGORY_ID FROM T_USER_VOCABULARY_PRACTICE WHERE VOCABULARY_ID = P_VOCABULARY_ID AND USERS_ID = P_USERS_ID;
+		RETURN V_CATEGORY_ID;
+	END;
+/
 ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 ------------------------------------Declare Procedures - "private" procedures---------------------------------------------------------------------------------------------------------------
 ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -296,11 +330,14 @@ CREATE OR REPLACE PROCEDURE INSERT_NEW_LANGUAGE_IF_NOT_EXISTS (P_LANGUAGE IN VAR
 
 -------------inserts a new vocabulary into the vocabulary table if not exists------------------------
 CREATE OR REPLACE PROCEDURE INSERT_NEW_VOCABULARY_IF_NOT_EXISTS (P_VOCABULARY IN VARCHAR2, P_TRANSLATION IN VARCHAR2, P_LANGUAGE IN VARCHAR2, P_UNIT_ID IN NUMBER)
-	IS V_ID_OF_LANGUAGE NUMBER;
+	IS 
+		V_ID_OF_LANGUAGE NUMBER;
+		V_VOCABULARY_ID NUMBER;
 	BEGIN
 		V_ID_OF_LANGUAGE := GET_ID_OF_LANGUAGE(P_LANGUAGE);
 		IF NOT VOCABULARY_EXISTS(P_VOCABULARY, P_TRANSLATION, P_UNIT_ID) THEN
-			INSERT INTO T_VOCABULARY (VOCABULARY, CATEGORY, COUNTER, UNIT_ID, LANGUAGE_ID) VALUES (P_VOCABULARY, 0, 0, P_UNIT_ID, V_ID_OF_LANGUAGE);
+			INSERT INTO T_VOCABULARY (VOCABULARY, UNIT_ID, LANGUAGE_ID) VALUES (P_VOCABULARY, P_UNIT_ID, V_ID_OF_LANGUAGE);
+			SELECT MAX(ID) INTO V_VOCABULARY_ID FROM T_VOCABULARY;
 			COMMIT;
 		END IF;
 	END; 
@@ -367,7 +404,7 @@ CREATE OR REPLACE PROCEDURE CREATE_NEW_STATISTIC (P_CATEGORY IN NUMBER, P_UNIT I
 		SELECT ID INTO V_STATISTIC_ID FROM T_STATISTIC WHERE ROWID=(SELECT MAX(ROWID) FROM T_STATISTIC);
 
 		--insert values into link table
-		FOR	I IN (SELECT DISTINCT VOC_ID AS ID FROM V_ALL_VOCABULARY_ENTRIES WHERE (CATEGORY = P_CATEGORY OR P_CATEGORY = -1) AND (UNIT = P_UNIT OR P_UNIT = ' '))
+		FOR	I IN (SELECT DISTINCT VOC_ID AS ID FROM V_ALL_VOCABULARY_ENTRIES WHERE (CATEGORY = P_CATEGORY OR P_CATEGORY = -1) AND (UNIT = P_UNIT OR P_UNIT = ' ') AND USERS_ID = P_USER_ID)
 		LOOP
 			INSERT INTO T_VOCABULARY_IN_STATISTIC (STATISTIC_ID, VOCABULARY_ID) VALUES (V_STATISTIC_ID, I.ID);		
 			COMMIT;
@@ -393,22 +430,41 @@ CREATE OR REPLACE PROCEDURE TRY_ANSWER(P_ID_OF_VOCABULARY_IN_STATISTIC IN NUMBER
 			END IF;
 		
 				UPDATE T_VOCABULARY_IN_STATISTIC SET CORRECT = V_CORRECT WHERE ID = P_ID_OF_VOCABULARY_IN_STATISTIC;
-				INSERT INTO T_USER_VOCABULARY_PRACTICE (USERS_ID, VOCABULARY_ID) VALUES (P_USER_ID, V_VOCABULARY_ID);
+						
+				REGISTER_PRACTICE(V_CORRECT = -1, V_VOCABULARY_ID, P_USER_ID);
 				IF STATISTIC_IS_FULL(V_STATISTIC_ID) THEN
-					UPDATE T_STATISTIC SET TIMESTAMP_DONE = CURRENT_TIMESTAMP;
-				
+					UPDATE T_STATISTIC SET TIMESTAMP_DONE = CURRENT_TIMESTAMP WHERE ID = V_STATISTIC_ID;
 				END IF;
 				COMMIT;
 		END IF;
 	END;
 /
 
+
+------------------------------------updates timestamp last practice----------------------------------------------------------------
+CREATE OR REPLACE PROCEDURE REGISTER_PRACTICE(P_CORRECT IN BOOLEAN, P_VOCABULARY_ID IN NUMBER, P_USER_ID IN NUMBER)
+	IS 
+	BEGIN
+		MERGE INTO T_USER_VOCABULARY_PRACTICE DEST 
+			USING (SELECT P_USER_ID AS USERS_ID, P_VOCABULARY_ID AS VOCABULARY_ID FROM DUAL) SRC
+			ON (SRC.USERS_ID = DEST.USERS_ID AND SRC.VOCABULARY_ID = DEST.VOCABULARY_ID)
+			WHEN MATCHED THEN
+				UPDATE SET TIMESTAMP_LAST_PRACTICE = CURRENT_TIMESTAMP
+				WHERE USERS_ID = P_USER_ID AND VOCABULARY_ID = P_VOCABULARY_ID
+			WHEN NOT MATCHED THEN
+				INSERT (USERS_ID, VOCABULARY_ID, CATEGORY, COUNTER) 
+				VALUES (P_USER_ID, P_VOCABULARY_ID, 0, 0);
+		COMMIT;		
+	END;
+/
+
+----------------------------------------------------------sends an email-------------------------------------------------------------------
 CREATE OR REPLACE PROCEDURE SEND_MAIL (P_TO_EMAIL IN VARCHAR2, P_SUBJECT IN VARCHAR2, P_MESSAGE IN  VARCHAR2)
   IS
-     V_FROM      VARCHAR2(80) := 'vocabeltrainer@COMPANY.com';
+     V_FROM      VARCHAR2(80) := 'vocabeltrainer@company.com';
      V_RECIPIENT VARCHAR2(80) := P_TO_EMAIL;
      V_SUBJECT   VARCHAR2(80) := P_SUBJECT;
-      V_MAIL_HOST VARCHAR2(30) := 'MAILSERVERHIERREIN';
+      V_MAIL_HOST VARCHAR2(30) := 'mailserver.de';
       V_MAIL_CONN UTL_SMTP.CONNECTION;
       CRLF        VARCHAR2(2)  := chr(13)||chr(10);
   BEGIN
@@ -434,6 +490,7 @@ IS
 	V_FIRSTNAME VARCHAR2(256);
 	V_LASTNAME VARCHAR2(256);
 	V_VOCABULARY_ID NUMBER;
+	V_UNIT_NAME VARCHAR2(256);
 	V_A VARCHAR2(256) := GET_RESSOURCE('voc_hello');
 	V_B VARCHAR2(256) := GET_RESSOURCE('voc_whoiam');
 	V_C VARCHAR2(256) := GET_RESSOURCE('voc_whatiwant');
@@ -442,26 +499,53 @@ IS
 	V_MESSAGE VARCHAR2(4096) := '';	
 BEGIN
 	
-			FOR	I IN (SELECT DISTINCT  U_ID FROM V_ALL_VOCABULARY_TO_LEARN)
+			FOR	I IN (SELECT DISTINCT  USERS_ID FROM V_ALL_VOCABULARY_TO_LEARN)
 			LOOP
 				V_MESSAGE := 'begin' || CRLF;
-				SELECT FIRST_NAME INTO V_FIRSTNAME FROM T_USERS WHERE ID = I.U_ID;
-				SELECT LAST_NAME INTO V_LASTNAME FROM T_USERS  WHERE ID = I.U_ID;
-				SELECT EMAIL INTO V_USER_EMAIL FROM T_USERS WHERE ID = I.U_ID;
-				FOR J IN (SELECT S_ID FROM V_ALL_VOCABULARY_TO_LEARN WHERE U_ID = I.U_ID)
+				SELECT FIRST_NAME INTO V_FIRSTNAME FROM T_USERS WHERE ID = I.USERS_ID;
+				SELECT LAST_NAME INTO V_LASTNAME FROM T_USERS  WHERE ID = I.USERS_ID;
+				SELECT EMAIL INTO V_USER_EMAIL FROM T_USERS WHERE ID = I.USERS_ID;
+				FOR J IN (SELECT VOC_IN_STAT_ID FROM V_ALL_VOCABULARY_TO_LEARN WHERE USERS_ID = I.USERS_ID)
 				LOOP
-					SELECT VOCABULARY_ID INTO V_VOCABULARY_ID FROM T_VOCABULARY_IN_STATISTIC WHERE ID = J.S_ID;
-					V_MESSAGE := V_MESSAGE || '/*' ||GET_VOCABULARY_BY_ID(V_VOCABULARY_ID) || ': ' || '*/TRY_ANSWER(' || TO_CHAR(J.S_ID) ||', '' '', '|| I.U_ID ||');' || CRLF;
+					SELECT VOCABULARY_ID INTO V_VOCABULARY_ID FROM T_VOCABULARY_IN_STATISTIC WHERE ID = J.VOC_IN_STAT_ID;
+					SELECT  U.NAME INTO V_UNIT_NAME FROM T_UNIT U INNER JOIN T_VOCABULARY V ON  U.ID = V.UNIT_ID WHERE V.ID = V_VOCABULARY_ID;
+					V_MESSAGE := V_MESSAGE || '/*' || V_UNIT_NAME || ': ' ||GET_VOCABULARY_BY_ID(V_VOCABULARY_ID) || '=> ' || '*/TRY_ANSWER(' || TO_CHAR(J.VOC_IN_STAT_ID) ||', '''', '|| I.USERS_ID ||');' || CRLF;
 				END LOOP;
-				V_MESSAGE := V_MESSAGE ||  'end;';
+				V_MESSAGE := V_MESSAGE || 'end;';
 				SEND_MAIL(V_USER_EMAIL, 'Lerne mal Vocabeln...',  V_A || V_FIRSTNAME || ' ' || V_LASTNAME || V_B || CRLF || V_C || CRLF || V_D || CRLF || CRLF || V_MESSAGE);
 			END LOOP;
 END;
 /
 
-CREATE OR REPLACE PROCEDURE CREATE_VOCABULARY_CHECKS
+-----------------------------------------------------WILL CREATE A STATISTIC FOR ANY VOCABULARY THAT IS NEEDED TO LEARN------------------------------------------------------------------------------
+CREATE OR REPLACE PROCEDURE CREATE_UNLEARNED_VOCABULARY_STATISTICS
 IS 
+		V_STATISTIC_ID NUMBER;
+		V_COUNT_ALREADY_TAKEN_VOCABULARY NUMBER;
 BEGIN
+	FOR I IN 
+	(
+		SELECT DISTINCT B.USERS_ID  AS ID
+			FROM (SELECT A.ID AS STATISTIC_ID, A.USERS_ID, B.VOCABULARY_ID FROM T_STATISTIC A INNER JOIN T_VOCABULARY_IN_STATISTIC B ON A.ID = B.STATISTIC_ID WHERE CORRECT IS NULL) A
+				RIGHT JOIN V_ALL_VOCABULARY_PRACTICES B ON A.USERS_ID = B.USERS_ID AND A.VOCABULARY_ID = B.VOCABULARY_ID
+			WHERE STATISTIC_ID IS NULL AND HOURS_NEEDED < 1
+	)
+	LOOP
+		INSERT INTO T_STATISTIC (USERS_ID) VALUES (I.ID);
+		SELECT MAX(ID) INTO V_STATISTIC_ID FROM T_STATISTIC;			
+		COMMIT;
+		FOR J IN 
+		(
+		SELECT DISTINCT B.VOCABULARY_ID AS ID
+		FROM (SELECT A.ID AS STATISTIC_ID, A.USERS_ID, B.VOCABULARY_ID FROM T_STATISTIC A INNER JOIN T_VOCABULARY_IN_STATISTIC B ON A.ID = B.STATISTIC_ID WHERE CORRECT IS NULL) A
+			RIGHT JOIN V_ALL_VOCABULARY_PRACTICES B ON A.USERS_ID = B.USERS_ID AND A.VOCABULARY_ID = B.VOCABULARY_ID
+		WHERE STATISTIC_ID IS NULL AND HOURS_NEEDED < 1		
+		)
+		LOOP
+			INSERT INTO T_VOCABULARY_IN_STATISTIC (STATISTIC_ID, VOCABULARY_ID) VALUES (V_STATISTIC_ID, J.ID);
+			COMMIT;		
+		END LOOP;
+	END LOOP;
 END;
 /
 
@@ -473,9 +557,9 @@ BEGIN
    	dbms_scheduler.create_job ( 
     		job_name => 'SEND_MAILS_TO_USERS', 
     		job_type => 'PLSQL_BLOCK', 
-    		job_action => 'SEND_MAILS;', 
+    		job_action => 'CREATE_UNLEARNED_VOCABULARY_STATISTICS;SEND_MAILS;', 
     		enabled => true, 
-    		repeat_interval => 'FREQ=DAILY;BYHOUR=8'
+    		repeat_interval => 'FREQ=HOURLY;INTERVAL=1'
    ); 
 END;
 /
@@ -487,64 +571,59 @@ INSERT INTO T_ALL_RESSOURCES (RES_KEY, RES) VALUES ('voc_hello', 'Hallo ');
 INSERT INTO T_ALL_RESSOURCES (RES_KEY, RES) VALUES ('voc_whoiam', '. Ich bin dein persoenlicher Vocabeltrainer :). ');
 INSERT INTO T_ALL_RESSOURCES (RES_KEY, RES) VALUES ('voc_whatiwant', 'Du hast schon lange keine Vocabeln mehr gelernt. Deswegen solltest du das jetzt unbedingt tun.');
 INSERT INTO T_ALL_RESSOURCES (RES_KEY, RES) VALUES ('voc_lastword', 'Wollte ich nur einmal gesagt haben. Danke. Und viel Spass beim Lernen ;).');
+INSERT INTO T_STATISTIC_TIME (CATEGORY, HOURS) VALUES (0, 1);
+INSERT INTO T_STATISTIC_TIME (CATEGORY, HOURS) VALUES (1, 2);
+INSERT INTO T_STATISTIC_TIME (CATEGORY, HOURS) VALUES (2, 8);
+INSERT INTO T_STATISTIC_TIME (CATEGORY, HOURS) VALUES (3, 20);
+INSERT INTO T_STATISTIC_TIME (CATEGORY, HOURS) VALUES (4, 40);
+INSERT INTO T_STATISTIC_TIME (CATEGORY, HOURS) VALUES (5, 60);
 COMMIT;
 ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 ------------------------------------Testscript ausführen---------------------------------------------------------------------------------------------------------------------------------------
 ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
---select * from all_vocabulary_entries where voc_id in (select voc_id from all_vocabulary_entries where translation in (select translation from all_vocabulary_entries where voc_id = 1))
 
 --to learn:
 --cube
 --rollup
 
 BEGIN
-	INSERT_NEW_VOCABULARY_WITH_TRANSLATION('DE', 'setzen, stellen, legen', 'EN', 'to put', '1');
-	INSERT_NEW_VOCABULARY_WITH_TRANSLATION('EN', 'to put', 'DE', 'setzen', '1');
-	INSERT_NEW_VOCABULARY_WITH_TRANSLATION('EN', 'to put', 'DE', 'stellen', '1');
-	INSERT_NEW_VOCABULARY_WITH_TRANSLATION('EN', 'to put', 'DE', 'legen', '1');
+	INSERT_NEW_VOCABULARY_WITH_TRANSLATION('DE', 'setzen, stellen, legen', 'EN', 'to put', 'Unit 1');
+	INSERT_NEW_VOCABULARY_WITH_TRANSLATION('EN', 'to put', 'DE', 'setzen', 'Unit 1');
+	INSERT_NEW_VOCABULARY_WITH_TRANSLATION('EN', 'to put', 'DE', 'stellen', 'Unit 1');
+	INSERT_NEW_VOCABULARY_WITH_TRANSLATION('EN', 'to put', 'DE', 'legen', 'Unit 1');
 	
 	
-	INSERT_NEW_VOCABULARY_WITH_TRANSLATION('DE', 'setzen', 'EN', 'to set', '1');
+	INSERT_NEW_VOCABULARY_WITH_TRANSLATION('DE', 'setzen', 'EN', 'to set', 'Unit 1');
 		
 	
-	INSERT_NEW_VOCABULARY_WITH_TRANSLATION('DE', 'rennen', 'EN', 'to career', '1');
-	INSERT_NEW_VOCABULARY_WITH_TRANSLATION('DE', 'rennen', 'EN', 'to run', '1');
-	INSERT_NEW_VOCABULARY_WITH_TRANSLATION('DE', 'rennen', 'EN', 'to race', '1');
-	INSERT_NEW_VOCABULARY_WITH_TRANSLATION('DE', 'to run, to race, to career', 'EN', 'rennen', '1');
+	INSERT_NEW_VOCABULARY_WITH_TRANSLATION('DE', 'rennen', 'EN', 'to career', 'Unit 1');
+	INSERT_NEW_VOCABULARY_WITH_TRANSLATION('DE', 'rennen', 'EN', 'to run', 'Unit 1');
+	INSERT_NEW_VOCABULARY_WITH_TRANSLATION('DE', 'rennen', 'EN', 'to race', 'Unit 1');
+	INSERT_NEW_VOCABULARY_WITH_TRANSLATION('DE', 'to run, to race, to career', 'EN', 'rennen', 'Unit 1');
 	
 	
-	INSERT_NEW_VOCABULARY_WITH_TRANSLATION('DE', 'sitzen', 'EN', 'to sit', '1');
+	INSERT_NEW_VOCABULARY_WITH_TRANSLATION('DE', 'sitzen', 'EN', 'to sit', 'Unit 1');
 	
 	
-	INSERT_NEW_VOCABULARY_WITH_TRANSLATION('DE', 'stehen', 'EN', 'to stand', '1');
+	INSERT_NEW_VOCABULARY_WITH_TRANSLATION('DE', 'stehen', 'EN', 'to stand', 'Unit 1');
 	
 	
-	INSERT_NEW_VOCABULARY_WITH_TRANSLATION('DE', 'gehen', 'EN', 'to walk', '1');
+	INSERT_NEW_VOCABULARY_WITH_TRANSLATION('DE', 'gehen', 'EN', 'to walk', 'Unit 1');
 	
 	
-	INSERT_NEW_VOCABULARY_WITH_TRANSLATION('EN', 'average', 'DE', 'durchschnitt', '1');
+	INSERT_NEW_VOCABULARY_WITH_TRANSLATION('EN', 'average', 'DE', 'durchschnitt', 'Unit 1');
 	
 	
-	INSERT_NEW_VOCABULARY_WITH_TRANSLATION('EN', 'to count', 'DE', 'zaehlen', '1');
+	INSERT_NEW_VOCABULARY_WITH_TRANSLATION('EN', 'to count', 'DE', 'zaehlen', 'Unit 1');
 	
 
 	
 
 	--will be inserted
-	
-	
-	--Creates a new Statistic
-	 CREATE_NEW_STATISTIC (-1, ' ', 1);
-	 CREATE_NEW_STATISTIC (-1, ' ', 2);
-	 
-
-		   
+	INSERT_NEW_USER('Simon','Klein','mail1');
+	INSERT_NEW_USER('Simon','Klein','mail2');
 
 	
 END;
 /
-
-	
-						
-	
 
