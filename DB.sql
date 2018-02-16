@@ -444,6 +444,8 @@ CREATE OR REPLACE PROCEDURE TRY_ANSWER(P_ID_OF_VOCABULARY_IN_STATISTIC IN NUMBER
 ------------------------------------updates timestamp last practice----------------------------------------------------------------
 CREATE OR REPLACE PROCEDURE REGISTER_PRACTICE(P_CORRECT IN BOOLEAN, P_VOCABULARY_ID IN NUMBER, P_USER_ID IN NUMBER)
 	IS 
+		V_CATEGORY NUMBER;
+		V_COUNTER NUMBER;
 	BEGIN
 		MERGE INTO T_USER_VOCABULARY_PRACTICE DEST 
 			USING (SELECT P_USER_ID AS USERS_ID, P_VOCABULARY_ID AS VOCABULARY_ID FROM DUAL) SRC
@@ -453,8 +455,30 @@ CREATE OR REPLACE PROCEDURE REGISTER_PRACTICE(P_CORRECT IN BOOLEAN, P_VOCABULARY
 				WHERE USERS_ID = P_USER_ID AND VOCABULARY_ID = P_VOCABULARY_ID
 			WHEN NOT MATCHED THEN
 				INSERT (USERS_ID, VOCABULARY_ID, CATEGORY, COUNTER) 
-				VALUES (P_USER_ID, P_VOCABULARY_ID, 0, 0);
+				VALUES (P_USER_ID, P_VOCABULARY_ID, 0, 0);	
 		COMMIT;		
+		
+		SELECT CATEGORY INTO V_CATEGORY FROM T_USER_VOCABULARY_PRACTICE WHERE VOCABULARY_ID = P_VOCABULARY_ID AND USERS_ID = P_USER_ID;
+		SELECT COUNTER INTO V_COUNTER FROM T_USER_VOCABULARY_PRACTICE WHERE VOCABULARY_ID = P_VOCABULARY_ID AND USERS_ID = P_USER_ID;
+		
+		IF P_CORRECT THEN
+			V_COUNTER := V_COUNTER+1;
+			IF V_COUNTER > 5 THEN
+				V_COUNTER := 0;
+				V_CATEGORY := V_CATEGORY + 1;
+				IF V_CATEGORY > 5 THEN
+					V_CATEGORY := 5;
+				END IF;
+			END IF;
+		ELSE
+			V_COUNTER := V_COUNTER - 1;
+			IF V_COUNTER < 0 THEN
+				V_COUNTER := 0;
+			END IF;
+		END IF;
+		
+		UPDATE T_USER_VOCABULARY_PRACTICE SET CATEGORY = V_CATEGORY, COUNTER = V_COUNTER WHERE VOCABULARY_ID = P_VOCABULARY_ID AND USERS_ID = P_USER_ID;
+		COMMIT;
 	END;
 /
 
@@ -464,7 +488,7 @@ CREATE OR REPLACE PROCEDURE SEND_MAIL (P_TO_EMAIL IN VARCHAR2, P_SUBJECT IN VARC
      V_FROM      VARCHAR2(80) := 'vocabeltrainer@company.com';
      V_RECIPIENT VARCHAR2(80) := P_TO_EMAIL;
      V_SUBJECT   VARCHAR2(80) := P_SUBJECT;
-      V_MAIL_HOST VARCHAR2(30) := 'mailserver.de';
+      V_MAIL_HOST VARCHAR2(30) := 'mail.company.com';
       V_MAIL_CONN UTL_SMTP.CONNECTION;
       CRLF        VARCHAR2(2)  := chr(13)||chr(10);
   BEGIN
@@ -553,11 +577,23 @@ END;
 -----------------------------------------------------------------------create jobs--------------------------------------------------------------------------------------------------
 ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 BEGIN 
-    DBMS_SCHEDULER.DROP_JOB ('SEND_MAILS_TO_USERS');
+    DBMS_SCHEDULER.DROP_JOB ('J_SEND_MAILS_TO_USERS');
    	dbms_scheduler.create_job ( 
-    		job_name => 'SEND_MAILS_TO_USERS', 
+    		job_name => 'J_SEND_MAILS_TO_USERS', 
     		job_type => 'PLSQL_BLOCK', 
     		job_action => 'CREATE_UNLEARNED_VOCABULARY_STATISTICS;SEND_MAILS;', 
+    		enabled => true, 
+    		repeat_interval => 'FREQ=DAILY;BYHOUR=6'
+   ); 
+END;
+/
+
+BEGIN 
+    DBMS_SCHEDULER.DROP_JOB ('J_CREATE_UNLEARNED_VOCABULARY_STATISTICS');
+   	dbms_scheduler.create_job ( 
+    		job_name => 'J_CREATE_UNLEARNED_VOCABULARY_STATISTICS', 
+    		job_type => 'PLSQL_BLOCK', 
+    		job_action => 'CREATE_UNLEARNED_VOCABULARY_STATISTICS;', 
     		enabled => true, 
     		repeat_interval => 'FREQ=HOURLY;INTERVAL=1'
    ); 
@@ -581,6 +617,7 @@ COMMIT;
 ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 ------------------------------------Testscript ausführen---------------------------------------------------------------------------------------------------------------------------------------
 ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+--select * from all_vocabulary_entries where voc_id in (select voc_id from all_vocabulary_entries where translation in (select translation from all_vocabulary_entries where voc_id = 1))
 
 --to learn:
 --cube
@@ -620,9 +657,7 @@ BEGIN
 	
 
 	--will be inserted
-	INSERT_NEW_USER('Simon','Klein','mail1');
-	INSERT_NEW_USER('Simon','Klein','mail2');
-
+	INSERT_NEW_USER('Simon','Klein','simon@company.de');
 	
 END;
 /
