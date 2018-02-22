@@ -1,7 +1,6 @@
 ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 ----------------------------Deleting previous generated Tables----------------------------------------------------------------------------------------------------------------------------
 ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
---SELECT 'begin' || chr(13) || chr(10) || 'TRY_ANSWER(' || listagg(voc_in_stat_id, ', '''', 1);' || chr(13) || chr(10) || 'TRY_ANSWER(') within group (order by voc_in_stat_id) over (partition by mail) || ', '''', 1);' || chr(13) || chr(10) || 'end;' as test from v_all_vocabulary_to_learn vl
 
 DROP TABLE T_DEBUG;
 DROP TABLE T_VOCABULARY_IN_STATISTIC;
@@ -91,7 +90,7 @@ CREATE TABLE T_VOCABULARY_IN_STATISTIC(
 
 CREATE TABLE T_DEBUG(
 	ID NUMBER GENERATED ALWAYS AS IDENTITY (START WITH 1 INCREMENT BY 1),
-	MESSAGE VARCHAR(128), 
+	MESSAGE VARCHAR2(1024), 
 	MESSAGE_NUM NUMBER,
 	CONSTRAINT DEBUG_PK PRIMARY KEY (ID)
 );
@@ -137,10 +136,11 @@ CREATE OR REPLACE FORCE VIEW V_ALL_VOCABULARY_TRANSLATIONS AS
 	
 --Any vocabulary to learn
 CREATE OR REPLACE FORCE VIEW V_ALL_VOCABULARY_TO_LEARN AS
-	SELECT TV.ID AS VOC_IN_STAT_ID, S.USERS_ID AS USERS_ID, U.EMAIL AS MAIL, TV.VOCABULARY_ID
+	SELECT TV.ID AS VOC_IN_STAT_ID, S.USERS_ID AS USERS_ID, U.EMAIL AS MAIL, TV.VOCABULARY_ID, V.VOCABULARY, U.FIRST_NAME || ' ' ||U.LAST_NAME AS NAME
 	FROM T_VOCABULARY_IN_STATISTIC TV 
 		INNER JOIN T_STATISTIC S ON TV.STATISTIC_ID = S.ID 
 		INNER JOIN T_USERS U ON U.ID = S.USERS_ID
+		INNER JOIN T_VOCABULARY V ON TV.VOCABULARY_ID = V.ID
 	WHERE TV.CORRECT IS NULL;
 	
 	
@@ -154,17 +154,21 @@ CREATE OR REPLACE FORCE VIEW V_ALL_VOCABULARY_PRACTICES AS
 			INNER JOIN T_STATISTIC_TIME STT ON STT.CATEGORY = A.CATEGORY
 ORDER BY A.USERS_ID, A.VOCABULARY_ID;
 
-
 -------------------------------------creates the view with any learning tag needed----------------------------------------
 CREATE OR REPLACE FORCE VIEW V_ALL_LEARNING_TAGS AS
 	SELECT DISTINCT 
 			USERS_ID, 
+			GET_RESSOURCE('voc_hello') ||
+			NAME || 
+			GET_RESSOURCE('voc_whoiam') ||  CHR(13) || CHR(10) ||
+			GET_RESSOURCE('voc_whatiwant') ||  CHR(13) || CHR(10) ||
+			GET_RESSOURCE('voc_lastword') ||  CHR(13) || CHR(10) || CHR(13) || CHR(10) ||
 			'BEGIN' || CHR(13) || CHR(10) || 'TRY_ANSWER(' || 
-			LISTAGG(VOC_IN_STAT_ID, ', '''', '|| USERS_ID ||');' ||
-			CHR(13) || CHR(10) || 'TRY_ANSWER(') 
-				WITHIN GROUP (ORDER BY VOC_IN_STAT_ID) OVER (PARTITION BY USERS_ID) || ', '''', '|| USERS_ID ||');' || CHR(13) || CHR(10) || 'END;' 
-				AS VOCABULARIES   
-	FROM V_ALL_VOCABULARY_TO_LEARN;
+      		LISTAGG('/*' ||VOCABULARY || '*/' || VOC_IN_STAT_ID, ', '''', '|| USERS_ID ||');' ||
+      		CHR(13) || CHR(10) || 'TRY_ANSWER(') 
+        WITHIN GROUP (ORDER BY VOC_IN_STAT_ID) OVER (PARTITION BY USERS_ID) || ', '''', '|| USERS_ID ||');' || CHR(13) || CHR(10) || 'END;' 
+        AS MESSAGE   
+  FROM V_ALL_VOCABULARY_TO_LEARN;
 
 ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 ------------------------------------Declare Check Functions----------------------------------------------------------------------------------------------------------------------------------
@@ -331,12 +335,58 @@ CREATE OR REPLACE PROCEDURE TRY_ANSWER(P_ID_OF_VOCABULARY_IN_STATISTIC IN NUMBER
 											GROUP BY CORRECT 
 											HAVING CORRECT IS NULL);
 				COMMIT;		
-						
+				
+				SHOW_ANSWERS_OF_STATISTIC(V_STATISTIC_ID);		
 				REGISTER_PRACTICE(V_CORRECT, V_VOCABULARY_ID, P_USER_ID);
 		END IF;
 	END;
 /
 
+------------------------------------sends a mail with the correct answers to a user if the given statistic is done----------------------------------------------------------------
+CREATE OR REPLACE PROCEDURE SHOW_ANSWERS_OF_STATISTIC (P_STATISTIC_ID IN NUMBER)
+	IS 
+		V_NUMBER_OF_STATISTIC_WITH_THIS_ID_DONE NUMBER;
+		V_MESSAGE VARCHAR2(10000);
+		CRLF VARCHAR2(2) := CHR(13) || CHR(10);
+		V_EMAIL VARCHAR2(100);
+		V_SUBJECT VARCHAR2(100);
+	BEGIN
+		SELECT COUNT(*) INTO V_NUMBER_OF_STATISTIC_WITH_THIS_ID_DONE FROM T_STATISTIC WHERE ID = P_STATISTIC_ID AND NOT TIMESTAMP_DONE IS NULL;
+		IF V_NUMBER_OF_STATISTIC_WITH_THIS_ID_DONE > 0 THEN
+		
+			SELECT DISTINCT LISTAGG(VALUE, CHR(13) || CHR(10) || CHR(13) || CHR(10)) 
+						WITHIN GROUP (ORDER BY STATISTIC_ID) 
+						OVER (PARTITION BY STATISTIC_ID) 
+						AS ANSWERS 
+			INTO V_MESSAGE 
+			FROM
+				(SELECT B.STATISTIC_ID, 
+								'''' || A.VOCABULARY || '''' ||GET_RESSOURCE('voc_ans_meaning') || A.TRANSLATION ||
+								' => ' || CASE(B.CORRECT) 
+													WHEN (-1) THEN 
+														GET_RESSOURCE('voc_ans_correct') 
+													ELSE 
+														GET_RESSOURCE('voc_ans_incorrect') 
+													END 
+								AS VALUE FROM 
+					(SELECT DISTINCT LISTAGG(TRANSLATION, ', ')
+         												WITHIN GROUP (ORDER BY TRANSLATION) 
+         				 								OVER (PARTITION BY A.VOCABULARY_ID) 
+														AS TRANSLATION, 
+      					  							B.VOCABULARY,
+      			 		 							A.VOCABULARY_ID
+					FROM T_TRANSLATION A 
+   			 			INNER JOIN T_VOCABULARY B ON A.VOCABULARY_ID = B.ID) A
+						INNER JOIN T_VOCABULARY_IN_STATISTIC B ON A.VOCABULARY_ID = B.VOCABULARY_ID
+					WHERE STATISTIC_ID = P_STATISTIC_ID) A;
+				
+				
+			SELECT EMAIL INTO V_EMAIL FROM T_USERS WHERE ID = (SELECT USERS_ID FROM T_STATISTIC WHERE ID = P_STATISTIC_ID);
+			
+			SEND_MAIL(V_EMAIL, GET_RESSOURCE('voc_ans_subject'), V_MESSAGE);
+		END IF;
+	END; 
+/		
 
 ------------------------------------updates timestamp last practice----------------------------------------------------------------
 CREATE OR REPLACE PROCEDURE REGISTER_PRACTICE(P_CORRECT IN NUMBER, P_VOCABULARY_ID IN NUMBER, P_USER_ID IN NUMBER)
@@ -397,33 +447,13 @@ CREATE OR REPLACE PROCEDURE SEND_MAIL (P_TO_EMAIL IN VARCHAR2, P_SUBJECT IN VARC
 
 CREATE OR REPLACE PROCEDURE SEND_MAILS
 IS
-	V_USER_EMAIL VARCHAR2(256);
-	V_FIRSTNAME VARCHAR2(256);
-	V_LASTNAME VARCHAR2(256);
-	V_VOCABULARY_ID NUMBER;
-	V_UNIT_NAME VARCHAR2(256);
-    CRLF VARCHAR2(2)  := CHR(13) || CHR(10);
-	V_MESSAGE VARCHAR2(4096) := '';	
+	V_USER_EMAIL VARCHAR2(40);
 BEGIN
-	
-			FOR	I IN (SELECT DISTINCT  USERS_ID FROM V_ALL_LEARNING_TAGS)
-			LOOP
-				
-				V_MESSAGE := 'begin' || CRLF;
-				SELECT FIRST_NAME INTO V_FIRSTNAME FROM T_USERS WHERE ID = I.USERS_ID;
-				SELECT LAST_NAME INTO V_LASTNAME FROM T_USERS  WHERE ID = I.USERS_ID;
-				SELECT EMAIL INTO V_USER_EMAIL FROM T_USERS WHERE ID = I.USERS_ID;
-				
-				FOR J IN (SELECT VOC_IN_STAT_ID FROM V_ALL_VOCABULARY_TO_LEARN WHERE USERS_ID = I.USERS_ID)
-				LOOP
-					SELECT VOCABULARY_ID INTO V_VOCABULARY_ID FROM T_VOCABULARY_IN_STATISTIC WHERE ID = J.VOC_IN_STAT_ID;
-					SELECT  U.NAME INTO V_UNIT_NAME FROM T_UNIT U INNER JOIN T_VOCABULARY V ON  U.ID = V.UNIT_ID WHERE V.ID = V_VOCABULARY_ID;
-					V_MESSAGE := V_MESSAGE || '/*' || V_UNIT_NAME || ': ' ||GET_VOCABULARY_BY_ID(V_VOCABULARY_ID) || '=> ' || '*/TRY_ANSWER(' || TO_CHAR(J.VOC_IN_STAT_ID) ||', '''', '|| I.USERS_ID ||');' || CRLF;
-				END LOOP;
-				V_MESSAGE := V_MESSAGE || 'end;';
-				
-				SEND_MAIL(V_USER_EMAIL, GET_RESSOURCE('voc_subject'),  GET_RESSOURCE('voc_hello') || V_FIRSTNAME || ' ' || V_LASTNAME || GET_RESSOURCE('voc_whoiam') || CRLF || GET_RESSOURCE('voc_whatiwant') || CRLF || GET_RESSOURCE('voc_lastword') || CRLF || CRLF || V_MESSAGE);
-			END LOOP;
+	FOR I IN (SELECT USERS_ID, MESSAGE FROM V_ALL_LEARNING_TAGS)
+	LOOP
+		SELECT EMAIL INTO V_USER_EMAIL FROM T_USERS WHERE ID = I.USERS_ID;
+		SEND_MAIL(V_USER_EMAIL, GET_RESSOURCE('voc_subject'),  I.MESSAGE);	
+	END LOOP;
 END;
 /
 
@@ -474,7 +504,6 @@ BEGIN
 END;
 /
 
-
 BEGIN 
     DBMS_SCHEDULER.DROP_JOB ('J_CREATE_UNLEARNED_VOCABULARY_STATISTICS');
    	dbms_scheduler.create_job ( 
@@ -494,7 +523,11 @@ INSERT INTO T_ALL_RESSOURCES (RES_KEY, RES) VALUES ('voc_hello', 'Hallo ');
 INSERT INTO T_ALL_RESSOURCES (RES_KEY, RES) VALUES ('voc_whoiam', '. Ich bin dein persoenlicher Vocabeltrainer :). ');
 INSERT INTO T_ALL_RESSOURCES (RES_KEY, RES) VALUES ('voc_whatiwant', 'Du hast schon lange keine Vocabeln mehr gelernt. Deswegen solltest du das jetzt unbedingt tun.');
 INSERT INTO T_ALL_RESSOURCES (RES_KEY, RES) VALUES ('voc_lastword', 'Wollte ich nur einmal gesagt haben. Danke. Und viel Spass beim Lernen ;).');
-INSERT INTO T_ALL_RESSOURCES (RES_KEY, RES) VALUES ('voc_subject', 'Lerne mal Vocabeln---');
+INSERT INTO T_ALL_RESSOURCES (RES_KEY, RES) VALUES ('voc_subject', 'Lerne mal Vocabeln...');
+INSERT INTO T_ALL_RESSOURCES (RES_KEY, RES) VALUES ('voc_ans_meaning', ' bedeutet: ');
+INSERT INTO T_ALL_RESSOURCES (RES_KEY, RES) VALUES ('voc_ans_correct', 'Deine Antwort war korrekt!');
+INSERT INTO T_ALL_RESSOURCES (RES_KEY, RES) VALUES ('voc_ans_incorrect', 'Deine Antwort war falsch!');
+INSERT INTO T_ALL_RESSOURCES (RES_KEY, RES) VALUES ('voc_ans_subject', 'Deine Ergebnisse');
 INSERT INTO T_STATISTIC_TIME (CATEGORY, HOURS) VALUES (0, 1);
 INSERT INTO T_STATISTIC_TIME (CATEGORY, HOURS) VALUES (1, 2);
 INSERT INTO T_STATISTIC_TIME (CATEGORY, HOURS) VALUES (2, 8);
@@ -505,7 +538,6 @@ COMMIT;
 ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 ------------------------------------Testscript ausführen---------------------------------------------------------------------------------------------------------------------------------------
 ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
---select * from all_vocabulary_entries where voc_id in (select voc_id from all_vocabulary_entries where translation in (select translation from all_vocabulary_entries where voc_id = 1))
 
 --to learn:
 --cube
@@ -546,7 +578,7 @@ BEGIN
 
 	--will be inserted
 	INSERT_NEW_USER('Simon','Klein','simon.klein@company.de');
-	INSERT_NEW_USER('Simon','Klein','simon.klein@company2.de');
+	INSERT_NEW_USER('Simon','Klein','simon.klein@company.de');
 	
 	
 	CREATE_NEW_STATISTIC(-1, ' ', 1);
